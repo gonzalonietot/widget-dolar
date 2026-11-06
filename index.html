@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Widget Dólar</title>
+<!--
+  Widget de cotizaciones del dólar en Argentina.
+  Datos: dolarapi.com (cotización actual) + api.argentinadatos.com (histórico, para variación y gráfico).
+  Ambas APIs son públicas y permiten llamadas desde cualquier dominio.
+
+  Opciones por URL (útil si lo embebés con <iframe>):
+    ?tipos=blue,oficial,bolsa   -> qué dólares mostrar y en qué orden
+                                   (oficial, blue, bolsa, contadoconliqui, mayorista, cripto, tarjeta)
+    ?tema=light | dark           -> fuerza un tema (por defecto sigue al sistema)
+    ?refresco=300                -> segundos entre actualizaciones (mínimo 60)
+-->
+<style>
+  :root {
+    --bg: #ffffff;
+    --card: #f6f7f9;
+    --border: #e3e6ea;
+    --text: #15181d;
+    --muted: #667080;
+    --up: #0f8a4a;
+    --down: #c8322b;
+    --flat: #7a828e;
+    --accent: #2b6cb0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1216; --card: #181c22; --border: #262c34;
+      --text: #e8ebef; --muted: #8b95a3;
+      --up: #38c27a; --down: #f0605a; --flat: #8b95a3; --accent: #6aa8ff;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1216; --card: #181c22; --border: #262c34;
+    --text: #e8ebef; --muted: #8b95a3;
+    --up: #38c27a; --down: #f0605a; --flat: #8b95a3; --accent: #6aa8ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  .wd { padding: 16px; max-width: 960px; margin: 0 auto; }
+  .wd-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  .wd-head h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
+  .wd-meta { color: var(--muted); font-size: 12px; display: flex; gap: 10px; align-items: center; }
+  .wd-meta button {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    border-radius: 6px; padding: 2px 8px; font: inherit; cursor: pointer;
+  }
+  .wd-meta button:hover { color: var(--text); }
+  .wd-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px; display: flex; flex-direction: column; gap: 8px; min-width: 0;
+  }
+  .card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .card-name { font-weight: 600; text-transform: uppercase; font-size: 12px; letter-spacing: .05em; }
+  .chg { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .chg.up { color: var(--up); } .chg.down { color: var(--down); } .chg.flat { color: var(--flat); }
+  .prices { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .lbl { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .val { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .spark { width: 100%; height: 36px; display: block; }
+  .card-foot { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; gap: 6px; }
+  .err { color: var(--down); font-size: 13px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; }
+  .skeleton .val, .skeleton .card-name { color: transparent; background: var(--border); border-radius: 4px; }
+  .wd-src { margin-top: 10px; color: var(--muted); font-size: 11px; }
+  .wd-src a { color: inherit; }
+</style>
+</head>
+<body>
+<div class="wd" id="dolar-widget" aria-live="polite">
+  <div class="wd-head">
+    <h1>Dólar hoy</h1>
+    <div class="wd-meta"><span id="wd-updated">Cargando…</span><button id="wd-refresh" type="button">Actualizar</button></div>
+  </div>
+  <div class="wd-grid" id="wd-grid"></div>
+  <div class="wd-src">Fuentes: <a href="https://dolarapi.com" target="_blank" rel="noopener">DolarApi</a> · histórico: <a href="https://argentinadatos.com" target="_blank" rel="noopener">ArgentinaDatos</a>. Valores orientativos.</div>
+</div>
+
+<script>
+(() => {
+  const NOMBRES = {
+    oficial: "Oficial", blue: "Blue", bolsa: "MEP", contadoconliqui: "CCL",
+    mayorista: "Mayorista", cripto: "Cripto", tarjeta: "Tarjeta"
+  };
+  const params = new URLSearchParams(location.search);
+  const tipos = (params.get("tipos") || "blue,oficial,bolsa,contadoconliqui,mayorista,cripto,tarjeta")
+    .split(",").map(s => s.trim()).filter(s => NOMBRES[s]);
+  const tema = params.get("tema");
+  if (tema === "light" || tema === "dark") document.documentElement.dataset.theme = tema;
+  const refrescoSeg = Math.max(60, Number(params.get("refresco")) || 300);
+
+  const grid = document.getElementById("wd-grid");
+  const updatedEl = document.getElementById("wd-updated");
+  const fmt = new Intl.NumberFormat("es-AR", { style: "currency", currency: "ARS", minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmtHora = new Intl.DateTimeFormat("es-AR", { timeZone: "America/Argentina/Buenos_Aires", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  const fechaAR = (d = new Date()) => new Intl.DateTimeFormat("en-CA", { timeZone: "America/Argentina/Buenos_Aires" }).format(d);
+
+  // El histórico cambia una vez por día: se pide una sola vez por carga.
+  const historicos = {};
+  async function getHistorico(casa) {
+    if (!historicos[casa]) {
+      historicos[casa] = fetch(`https://api.argentinadatos.com/v1/cotizaciones/dolares/${casa}`)
+        .then(r => r.ok ? r.json() : [])
+        .then(d => d.slice(-40))
+        .catch(() => []);
+    }
+    return historicos[casa];
+  }
+
+  function sparkline(valores) {
+    if (valores.length < 2) return "";
+    const w = 200, h = 36, p = 2;
+    const min = Math.min(...valores), max = Math.max(...valores), rango = max - min || 1;
+    const pts = valores.map((v, i) => `${(p + i * (w - 2 * p) / (valores.length - 1)).toFixed(1)},${(h - p - (v - min) / rango * (h - 2 * p)).toFixed(1)}`);
+    const color = valores.at(-1) >= valores[0] ? "var(--up)" : "var(--down)";
+    return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
+      <polyline points="${pts.join(" ")}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
+  }
+
+  function skeleton() {
+    grid.innerHTML = tipos.map(t => `<div class="card skeleton"><div class="card-top"><span class="card-name">${NOMBRES[t]}</span></div>
+      <div class="prices"><div><div class="lbl">Compra</div><div class="val">0000</div></div><div><div class="lbl">Venta</div><div class="val">0000</div></div></div></div>`).join("");
+  }
+
+  async function cargar() {
+    updatedEl.textContent = "Actualizando…";
+    try {
+      const r = await fetch("https://dolarapi.com/v1/dolares", { cache: "no-store" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const actuales = await r.json();
+      const porCasa = Object.fromEntries(actuales.map(d => [d.casa, d]));
+      const oficial = porCasa.oficial?.venta;
+      const cards = await Promise.all(tipos.map(async casa => {
+        const d = porCasa[casa];
+        if (!d) return "";
+        // Se compara contra el cierre anterior a la fecha del dato (no a "hoy"),
+        // porque oficial y tarjeta a veces vienen con fecha del día anterior.
+        const hoy = fechaAR(new Date(d.fechaActualizacion));
+        const hist = await getHistorico(casa);
+        const previo = [...hist].reverse().find(h => h.fecha < hoy);
+        let chgHtml = `<span class="chg flat">—</span>`;
+        if (previo && previo.venta) {
+          const pct = (d.venta - previo.venta) / previo.venta * 100;
+          const cls = Math.abs(pct) < 0.005 ? "flat" : pct > 0 ? "up" : "down";
+          const flecha = cls === "up" ? "▲" : cls === "down" ? "▼" : "●";
+          chgHtml = `<span class="chg ${cls}" title="Vs. cierre ${previo.fecha}: ${fmt.format(previo.venta)}">${flecha} ${pct.toFixed(2).replace(".", ",")}%</span>`;
+        }
+        const serie = hist.filter(h => h.fecha < hoy).slice(-29).map(h => h.venta).concat(d.venta);
+        const brecha = oficial && casa !== "oficial" && casa !== "mayorista" && casa !== "tarjeta"
+          ? `Brecha ${((d.venta / oficial - 1) * 100).toFixed(1).replace(".", ",")}%` : "";
+        return `<div class="card">
+          <div class="card-top"><span class="card-name">Dólar ${NOMBRES[casa]}</span>${chgHtml}</div>
+          <div class="prices">
+            <div><div class="lbl">Compra</div><div class="val">${d.compra != null ? fmt.format(d.compra) : "—"}</div></div>
+            <div><div class="lbl">Venta</div><div class="val">${fmt.format(d.venta)}</div></div>
+          </div>
+          ${sparkline(serie)}
+          <div class="card-foot"><span>${fmtHora.format(new Date(d.fechaActualizacion))} hs</span><span>${brecha}</span></div>
+        </div>`;
+      }));
+      grid.innerHTML = cards.join("");
+      updatedEl.textContent = `Actualizado ${fmtHora.format(new Date())} hs`;
+    } catch (e) {
+      if (!grid.querySelector(".card:not(.skeleton)")) {
+        grid.innerHTML = `<div class="err">No se pudieron cargar las cotizaciones (${e.message}). Reintentando en unos minutos.</div>`;
+      }
+      updatedEl.textContent = "Error al actualizar";
+    }
+  }
+
+  skeleton();
+  cargar();
+  setInterval(cargar, refrescoSeg * 1000);
+  document.getElementById("wd-refresh").addEventListener("click", cargar);
+})();
+</script>
+</body>
+</html>
